@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+dist-electron/
+out/
+packages/*/dist/
+packages/desktop/.vite/
+packages/desktop/release/
+
+# Runtime data (SQLite + file storage). Never commit — DATA_DIR is per-env.
+packages/server/data/
+packages/server/*-data/
+
+# Report artifacts and all markdown — kept out of the repo per request.
+docs/
+README.md
+*.md
+
+# Local env
+.env
+.env.local
+
+# Misc
+*.log
+.DS_Store
