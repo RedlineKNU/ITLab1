@@ -178,9 +178,12 @@ export class WebSyncService {
             await writable.write(dl.buffer);
             await writable.close();
             const file = await fileHandle.getFile();
+            // Use the value from the fresh listFiles() (action.remote), not from
+            // the download response header — the latter can be served from the
+            // browser cache with a stale timestamp, which keeps re-downloading.
             await writeManifestEntry(action.name, {
               localLastModified: file.lastModified,
-              serverModifiedAt: dl.modifiedAt || action.remote.modifiedAt,
+              serverModifiedAt: action.remote.modifiedAt,
             });
             this._emit({
               type: 'action', action: 'download', name: action.name,

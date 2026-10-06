@@ -91,6 +91,7 @@ export class ApiClient {
   async downloadFile(id) {
     const res = await this.fetchImpl(this._url(`/api/files/${id}/download`), {
       headers: this._headers(),
+      cache: 'no-store',
     });
     if (!res.ok) {
       const text = await res.text();
