@@ -1,4 +1,4 @@
-import { compareFileLists, SYNC_STATES } from '@mini-drive/shared/sync';
+import { SYNC_STATES } from '@mini-drive/shared/sync';
 import {
   readManifest,
   writeManifestEntry,
@@ -10,41 +10,55 @@ import {
 } from './manifest.js';
 
 const HANDLE_KEY = 'syncDirHandle';
+const IGNORE_NAMES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
 
 export function isFileSystemAccessSupported() {
   return typeof window !== 'undefined' && 'showDirectoryPicker' in window;
 }
 
-async function listLocal(dirHandle, manifest) {
+async function listLocal(dirHandle) {
   const out = [];
   for await (const [name, handle] of dirHandle.entries()) {
     if (handle.kind !== 'file') continue;
+    if (IGNORE_NAMES.has(name)) continue;
     const file = await handle.getFile();
-    const entry = manifest[name];
-    // Browser can't set mtime: use manifest value once we've touched the file.
-    const effectiveLocal = entry?.localLastModified
-      ? Math.max(entry.localLastModified, file.lastModified)
-      : file.lastModified;
-    out.push({
-      name,
-      size: file.size,
-      lastModified: file.lastModified,
-      modifiedAt: new Date(effectiveLocal).toISOString(),
-      handle,
-    });
+    out.push({ name, size: file.size, lastModified: file.lastModified, handle });
   }
   return out;
 }
 
-function remoteForCompare(remote, manifest) {
-  // Pin remote modifiedAt to the stored value so sync converges and doesn't ping-pong.
-  return remote.map((r) => {
-    const entry = manifest[r.name];
-    if (entry && entry.serverModifiedAt === r.modifiedAt) {
-      return { ...r, modifiedAt: entry.serverModifiedAt };
+// Web-specific: compares current observed values to what the manifest recorded
+// at the previous sync, so cross-clock drift between browser and server can't
+// cause a ping-pong. Timestamps are only used to break true conflicts.
+function decideActions(local, remote, manifest) {
+  const names = new Set();
+  for (const f of local) names.add(f.name);
+  for (const f of remote) names.add(f.name);
+  const actions = [];
+  for (const name of names) {
+    const l = local.find((f) => f.name === name);
+    const r = remote.find((f) => f.name === name);
+    const m = manifest[name];
+    if (l && !r) {
+      actions.push({ name, kind: 'upload', reason: 'only-local', local: l });
+    } else if (!l && r) {
+      actions.push({ name, kind: 'download', reason: 'only-remote', remote: r });
+    } else if (l && r) {
+      const localChanged = !m || l.lastModified !== m.localLastModified;
+      const remoteChanged = !m || r.modifiedAt !== m.serverModifiedAt;
+      if (!localChanged && !remoteChanged) {
+        actions.push({ name, kind: 'skip', reason: 'in-sync', local: l, remote: r });
+      } else if (localChanged && !remoteChanged) {
+        actions.push({ name, kind: 'upload', reason: 'local-changed', local: l, remote: r });
+      } else if (!localChanged && remoteChanged) {
+        actions.push({ name, kind: 'download', reason: 'remote-changed', local: l, remote: r });
+      } else {
+        // Both sides changed since last sync — pick remote as safer default.
+        actions.push({ name, kind: 'download', reason: 'conflict-remote-wins', local: l, remote: r });
+      }
     }
-    return r;
-  });
+  }
+  return actions;
 }
 
 export class WebSyncService {
@@ -109,7 +123,9 @@ export class WebSyncService {
     this.stop();
     this._emit({ type: 'started', path: this.dirHandle.name, at: new Date().toISOString() });
     this.intervalId = setInterval(() => {
-      this.syncOnce().catch((err) => this._emit({ type: 'action', action: 'error', name: '-', error: err.message, at: new Date().toISOString() }));
+      this.syncOnce().catch((err) => this._emit({
+        type: 'action', action: 'error', name: '-', error: err.message, at: new Date().toISOString(),
+      }));
     }, intervalMs);
     await this.syncOnce();
   }
@@ -128,31 +144,30 @@ export class WebSyncService {
     this.inflight = true;
     try {
       const manifest = await readManifest();
-      const [localRaw, remoteRaw] = await Promise.all([
-        listLocal(this.dirHandle, manifest),
+      const [local, remote] = await Promise.all([
+        listLocal(this.dirHandle),
         this.api.listFiles(),
       ]);
-      const remote = remoteForCompare(remoteRaw, manifest);
-      const actions = compareFileLists(localRaw, remote);
+      const actions = decideActions(local, remote, manifest);
 
       for (const action of actions) {
         try {
           if (action.kind === 'upload') {
             this._emit({ type: 'file-state', name: action.name, state: SYNC_STATES.UPLOADING });
-            const fileHandle = action.local.handle;
-            const file = await fileHandle.getFile();
+            const file = await action.local.handle.getFile();
             const buffer = new Uint8Array(await file.arrayBuffer());
             const uploaded = await this.api.uploadFile(action.name, buffer);
+            // Re-read the file after upload: lastModified may have shifted
+            // (writable close bumps it), and we need the exact value we'll
+            // observe next cycle to detect "no change".
+            const after = await action.local.handle.getFile();
             await writeManifestEntry(action.name, {
-              localLastModified: file.lastModified,
+              localLastModified: after.lastModified,
               serverModifiedAt: uploaded.modifiedAt,
             });
             this._emit({
-              type: 'action',
-              action: 'upload',
-              name: action.name,
-              reason: action.reason,
-              at: new Date().toISOString(),
+              type: 'action', action: 'upload', name: action.name,
+              reason: action.reason, at: new Date().toISOString(),
             });
             this._emit({ type: 'file-state', name: action.name, state: SYNC_STATES.SYNCED });
           } else if (action.kind === 'download') {
@@ -168,11 +183,8 @@ export class WebSyncService {
               serverModifiedAt: dl.modifiedAt || action.remote.modifiedAt,
             });
             this._emit({
-              type: 'action',
-              action: 'download',
-              name: action.name,
-              reason: action.reason,
-              at: new Date().toISOString(),
+              type: 'action', action: 'download', name: action.name,
+              reason: action.reason, at: new Date().toISOString(),
             });
             this._emit({ type: 'file-state', name: action.name, state: SYNC_STATES.SYNCED });
           } else {
@@ -180,11 +192,8 @@ export class WebSyncService {
           }
         } catch (err) {
           this._emit({
-            type: 'action',
-            action: 'error',
-            name: action.name,
-            error: err.message,
-            at: new Date().toISOString(),
+            type: 'action', action: 'error', name: action.name,
+            error: err.message, at: new Date().toISOString(),
           });
           this._emit({ type: 'file-state', name: action.name, state: SYNC_STATES.ERROR });
         }
