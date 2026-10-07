@@ -17,6 +17,8 @@ packages/server/*-data/
 docs/
 README.md
 *.md
+mini-demo/
+*.png
 
 # Local env
 .env
